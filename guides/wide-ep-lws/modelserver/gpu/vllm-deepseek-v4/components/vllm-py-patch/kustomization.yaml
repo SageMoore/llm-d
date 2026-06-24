@@ -1,0 +1,57 @@
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+# TEST-ONLY: inject Python-only vLLM source changes without rebuilding the image.
+# Ships components/vllm-py-patch/vllm.patch as a ConfigMap, mounts it at /vllm-patch,
+# and the base launch script (decode.yaml / prefill.yaml) runs `git apply` on it at
+# startup. Compiled CUDA/C++ extensions in the image are untouched.
+#
+# Usage:
+#   1. Put your unified diff in this dir:
+#        git -C /path/to/vllm diff > components/vllm-py-patch/vllm.patch
+#      Paths must be repo-root relative (a/vllm/... b/vllm/...) so `git apply -p1` lands
+#      in site-packages. Must apply cleanly against the vLLM in the image (v0.23.0).
+#   2. Compose this component into the deployment you're benchmarking, e.g. add to
+#      deployments/<name>/kustomization.yaml under `components:`:
+#        - ../../components/vllm-py-patch
+#   3. Apply / restart. Watch pod logs for "vllm-py-patch: applied OK".
+#   4. Remove the component line when done.
+#
+# NOTE: stable ConfigMap name (no hash suffix) so editing vllm.patch does NOT trigger a
+# rollout on its own — force a pod restart to pick up a changed diff.
+configMapGenerator:
+  - name: vllm-py-patch
+    files:
+      - vllm.patch
+generatorOptions:
+  disableNameSuffixHash: true
+patches:
+  - target:
+      kind: LeaderWorkerSet
+      name: ".*-decode"
+    patch: |-
+      - op: add
+        path: /spec/leaderWorkerTemplate/workerTemplate/spec/volumes/-
+        value:
+          name: vllm-py-patch
+          configMap:
+            name: vllm-py-patch
+      - op: add
+        path: /spec/leaderWorkerTemplate/workerTemplate/spec/containers/0/volumeMounts/-
+        value:
+          name: vllm-py-patch
+          mountPath: /vllm-patch
+  - target:
+      kind: LeaderWorkerSet
+      name: ".*-prefill"
+    patch: |-
+      - op: add
+        path: /spec/leaderWorkerTemplate/workerTemplate/spec/volumes/-
+        value:
+          name: vllm-py-patch
+          configMap:
+            name: vllm-py-patch
+      - op: add
+        path: /spec/leaderWorkerTemplate/workerTemplate/spec/containers/0/volumeMounts/-
+        value:
+          name: vllm-py-patch
+          mountPath: /vllm-patch

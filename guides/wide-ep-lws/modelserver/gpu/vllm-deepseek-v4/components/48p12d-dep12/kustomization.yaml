@@ -1,0 +1,21 @@
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+# SGLang-parity topology: 6 prefill workers (DEP8) + 1 decode worker (DEP12)
+# -> 6x8 + 1x12 = 60 GPUs / 15 nodes total.
+# Prefill worker: TP=1, DP=8,  EP=8  (DEP8,  2 nodes).
+# Decode  worker: TP=1, DP=12, EP=12 (DEP12, 3 nodes).
+patches:
+  - target:
+      kind: LeaderWorkerSet
+      name: ".*-prefill"
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 6
+  - target:
+      kind: LeaderWorkerSet
+      name: ".*-decode"
+    patch: |-
+      - op: replace
+        path: /spec/leaderWorkerTemplate/size
+        value: 3

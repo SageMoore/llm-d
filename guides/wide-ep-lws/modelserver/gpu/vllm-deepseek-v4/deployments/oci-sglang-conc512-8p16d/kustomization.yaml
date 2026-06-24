@@ -1,0 +1,7 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# SGLang-parity: 8 prefill : 16 decode (DEP16) -> 24 GPUs / 6 nodes. Benchmark at conc 512.
+resources:
+  - ../../providers/oci
+components:
+  - ../../components/8p16d-dep16

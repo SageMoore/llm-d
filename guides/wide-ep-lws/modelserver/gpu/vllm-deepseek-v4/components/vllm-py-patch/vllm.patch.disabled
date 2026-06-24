@@ -1,0 +1,346 @@
+diff --git a/vllm/config/parallel.py b/vllm/config/parallel.py
+index f7fb8ec42..91bc97482 100644
+--- a/vllm/config/parallel.py
++++ b/vllm/config/parallel.py
+@@ -83,6 +83,11 @@ class EPLBConfig:
+     Whether to use non-blocking EPLB.
+     """
+ 
++    disable_metrics_collection: bool = False
++    """
++    Can be used to disable EPLB prometheus metrics collection.
++    """
++
+     policy: EPLBPolicyOption = "default"
+     """The policy type for expert parallel load balancing (EPLB)."""
+ 
+diff --git a/vllm/distributed/eplb/eplb_state.py b/vllm/distributed/eplb/eplb_state.py
+index 2ad4aa9e7..5b45aeaf5 100644
+--- a/vllm/distributed/eplb/eplb_state.py
++++ b/vllm/distributed/eplb/eplb_state.py
+@@ -87,6 +87,65 @@ class EplbStats:
+     """
+ 
+ 
++class EplbMetricsState:
++    """Per-model state for the EPLB Prometheus metrics."""
++
++    def __init__(self, num_layers: int, device: torch.device):
++        self.cumulative_tokens: torch.Tensor = torch.zeros(
++            num_layers, dtype=torch.int64, device=device
++        )
++        self.cumulative_tokens_cpu: torch.Tensor = torch.zeros(
++            num_layers, dtype=torch.int64, device="cpu", pin_memory=True
++        )
++        self.event: torch.cuda.Event = torch.cuda.Event()
++        self.previous_cumulative_tokens: torch.Tensor = torch.zeros(
++            num_layers, dtype=torch.int64, device="cpu"
++        )
++        self.pending: bool = False
++        self.delta: list[int] | None = None
++
++    def accumulate(self, expert_load_pass: torch.Tensor) -> None:
++        """
++        Adds the per-rank routed tokens from this step into the cumulative total.
++        This code assumes that expert_load_pass is zeroed out between calls.
++        Args:
++            expert_load_pass: (num_moe_layers, num_physical_experts) contains the number
++            of routed tokens for each layer and physical expert across all ranks.
++            Populated by the router and zeroed out by EPLB every step.
++        """
++        ep_group = get_ep_group().device_group
++        ep_size = ep_group.size()
++        rank = ep_group.rank()
++        # (num_moe_layers,) where each element is the number of tokens routed
++        # to "rank" for that layer
++        per_layer_tokens = expert_load_pass.reshape(
++            expert_load_pass.shape[0], ep_size, -1
++        )[:, rank, :].sum(dim=-1)
++
++        # Add the per_layer routed tokens for this rank to the cumulative total.
++        # This tensor is asynchronously copied to cpu in EplbMetricsState.step().
++        # Because the copy is async and non-blocking, this tensor needs to hold
++        # multiple steps worth of routed tokens.
++        self.cumulative_tokens.add_(per_layer_tokens)
++
++    def step(self) -> None:
++        """Records a snapshot of cumulative_tokens and then compute the delta from the
++        previous snapshot."""
++        # If there's not a device to host transfer in-flight, start one
++        if not self.pending:
++            self.cumulative_tokens_cpu.copy_(self.cumulative_tokens, non_blocking=True)
++            self.event.record()
++            self.pending = True
++            self.delta = None
++        # if the transfer from device to host has finished, compute the result
++        elif self.event.query():
++            self.delta = (
++                self.cumulative_tokens_cpu - self.previous_cumulative_tokens
++            ).tolist()
++            self.previous_cumulative_tokens.copy_(self.cumulative_tokens_cpu)
++            self.pending = False
++
++
+ @dataclass
+ class EplbModelState:
+     """EPLB metrics."""
+@@ -196,6 +255,10 @@ class EplbModelState:
+     """
+     The communicator for expert weight transfers.
+     """
++    metrics_state: EplbMetricsState
++    """
++    State used to populate Prometheus metrics
++    """
+     pending_result: AsyncEplbLayerResult | None = None
+     """
+     Set by the async worker after all writes to expert_buffer are done. Consumed
+@@ -467,6 +530,10 @@ class EplbState:
+             eplb_stats=None,
+             cuda_device_index=self.cuda_device_index,
+             communicator=communicator,
++            metrics_state=EplbMetricsState(
++                num_layers=model.num_moe_layers,
++                device=self.device,
++            ),
+         )
+         self.model_states[model_config.compute_hash()] = model_state
+         self.num_valid_physical_experts = model.num_physical_experts
+@@ -506,6 +573,14 @@ class EplbState:
+             for eplb_model_state in self.model_states.values():
+                 eplb_model_state.expert_load_pass.zero_()
+ 
++        # Metrics collection is on by default
++        if not self.parallel_config.eplb_config.disable_metrics_collection:
++            for eplb_model_state in self.model_states.values():
++                eplb_model_state.metrics_state.accumulate(
++                    eplb_model_state.expert_load_pass
++                )
++                eplb_model_state.metrics_state.step()
++
+         if (
+             log_stats
+             and self.expert_rearrangement_step
+@@ -612,6 +687,12 @@ class EplbState:
+         1) The next rearrangement step, so the sliding window is ready.
+         2) The next balancedness logging step, when log_stats is enabled.
+         """
++
++        # If eplb metrics are being collected, which is the default behavior,
++        # _should_record_current_step returns True
++        if not self.parallel_config.eplb_config.disable_metrics_collection:
++            return True
++
+         steps_remaining = (
+             self.expert_rearrangement_step_interval - self.expert_rearrangement_step
+         )
+@@ -634,6 +715,14 @@ class EplbState:
+                 self._should_record_current_step(log_stats=log_stats)
+             )
+ 
++    def get_latest_metric_delta(self) -> dict[str, list[int]]:
++        """Returns per-model routed tokens since the last snapshot."""
++        return {
++            state.model_name: state.metrics_state.delta
++            for state in self.model_states.values()
++            if state.metrics_state.delta is not None
++        }
++
+     def _init_should_record_tensor(self, model: "MixtureOfExperts") -> None:  # type: ignore[name-defined]
+         """Allocate (once) and propagate the shared ``should_record_tensor``.
+ 
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 889232c3e..dedb3c29f 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -52,7 +52,11 @@ from vllm.v1.core.sched.utils import check_stop, remove_all
+ from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+ from vllm.v1.kv_cache_interface import KVCacheConfig
+ from vllm.v1.metrics.perf import ModelMetrics, PerfStats
+-from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
++from vllm.v1.metrics.stats import (
++    EplbMetrics,
++    PrefixCacheStats,
++    SchedulerStats,
++)
+ from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
+ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+ from vllm.v1.spec_decode.metrics import SpecDecodingStats
+@@ -1339,6 +1343,7 @@ class Scheduler(SchedulerInterface):
+         num_nans_in_logits = model_runner_output.num_nans_in_logits
+         kv_connector_output = model_runner_output.kv_connector_output
+         cudagraph_stats = model_runner_output.cudagraph_stats
++        eplb_metrics = model_runner_output.eplb_metrics
+ 
+         perf_stats: PerfStats | None = None
+         if self.perf_metrics and self.perf_metrics.is_enabled():
+@@ -1636,7 +1641,11 @@ class Scheduler(SchedulerInterface):
+ 
+         if (
+             stats := self.make_stats(
+-                spec_decoding_stats, kv_connector_stats, cudagraph_stats, perf_stats
++                spec_decoding_stats,
++                kv_connector_stats,
++                cudagraph_stats,
++                perf_stats,
++                eplb_metrics,
+             )
+         ) is not None:
+             # Return stats to only one of the front-ends.
+@@ -2026,6 +2035,7 @@ class Scheduler(SchedulerInterface):
+         kv_connector_stats: KVConnectorStats | None = None,
+         cudagraph_stats: CUDAGraphStat | None = None,
+         perf_stats: PerfStats | None = None,
++        eplb_metrics: EplbMetrics | None = None,
+     ) -> SchedulerStats | None:
+         if not self.log_stats:
+             return None
+@@ -2056,6 +2066,7 @@ class Scheduler(SchedulerInterface):
+             kv_connector_stats=connector_stats_payload,
+             cudagraph_stats=cudagraph_stats,
+             perf_stats=perf_stats,
++            eplb_metrics=eplb_metrics,
+         )
+ 
+     def make_spec_decoding_stats(
+diff --git a/vllm/v1/metrics/loggers.py b/vllm/v1/metrics/loggers.py
+index 0052a3536..5a9a05797 100644
+--- a/vllm/v1/metrics/loggers.py
++++ b/vllm/v1/metrics/loggers.py
+@@ -526,6 +526,13 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
+             gauge_kv_cache_usage, per_engine_labelvalues
+         )
+ 
++        # Cumulative count of tokens routed per (model, layer, rank).
++        self.counter_eplb_tokens_per_rank = self._counter_cls(
++            name="vllm:eplb_tokens_per_rank_total",
++            documentation="Cumulative tokens routed per (model, layer, rank).",
++            labelnames=labelnames + ["model", "layer", "rank"],
++        )
++
+         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
+             counter_corrupted_requests = self._counter_cls(
+                 name="vllm:corrupted_requests",
+@@ -1108,6 +1115,22 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
+             if scheduler_stats.perf_stats is not None:
+                 self.perf_metrics_prom.observe(scheduler_stats.perf_stats, engine_idx)
+ 
++            if scheduler_stats.eplb_metrics is not None:
++                model_name, engine = self.per_engine_labelvalues[engine_idx]
++                rank = str(scheduler_stats.eplb_metrics.ep_rank)
++                for (
++                    model,
++                    delta,
++                ) in scheduler_stats.eplb_metrics.num_routed_tokens.items():
++                    for layer_idx, value in enumerate(delta):
++                        self.counter_eplb_tokens_per_rank.labels(
++                            model_name=model_name,
++                            engine=engine,
++                            model=model,
++                            layer=str(layer_idx),
++                            rank=rank,
++                        ).inc(value)
++
+             if (
+                 self.kv_cache_metrics_enabled
+                 and scheduler_stats.kv_cache_eviction_events
+diff --git a/vllm/v1/metrics/stats.py b/vllm/v1/metrics/stats.py
+index a7a5fb7a2..c82d19e6f 100644
+--- a/vllm/v1/metrics/stats.py
++++ b/vllm/v1/metrics/stats.py
+@@ -167,6 +167,21 @@ class KVCacheEvictionEvent:
+     reuse_gaps_seconds: tuple[float, ...]
+ 
+ 
++@dataclass
++class EplbMetrics:
++    """
++    Stores EPLB metrics.
++
++    - `ep_rank`: The EP rank of the worker that produced this sample.
++    - `num_routed_tokens`: For each model, a list of per-layer token
++      counts. Each count is the number of tokens routed to this rank's
++      experts in that layer since the previous sample.
++    """
++
++    ep_rank: int = 0
++    num_routed_tokens: dict[str, list[int]] = field(default_factory=dict)
++
++
+ @dataclass
+ class SchedulerStats:
+     """Stats associated with the scheduler."""
+@@ -197,6 +212,8 @@ class SchedulerStats:
+ 
+     perf_stats: PerfStats | None = None
+ 
++    eplb_metrics: EplbMetrics | None = None
++
+ 
+ @dataclass
+ class RequestStateStats:
+diff --git a/vllm/v1/outputs.py b/vllm/v1/outputs.py
+index 9f13ad939..c5d1ed4cd 100644
+--- a/vllm/v1/outputs.py
++++ b/vllm/v1/outputs.py
+@@ -11,6 +11,7 @@ import torch
+ 
+ from vllm.compilation.cuda_graph import CUDAGraphStat
+ from vllm.v1.core.sched.output import SchedulerOutput
++from vllm.v1.metrics.stats import EplbMetrics
+ 
+ if TYPE_CHECKING:
+     from vllm.distributed.kv_events import KVConnectorKVEvents
+@@ -280,6 +281,8 @@ class ModelRunnerOutput:
+     # ``None`` when ``enable_return_routed_experts`` is off.
+     routed_experts: RoutedExpertsLists | None = None
+ 
++    eplb_metrics: EplbMetrics | None = None
++
+     @staticmethod
+     def with_kv_conn_output_only(
+         kv_connector_output: KVConnectorOutput | None,
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 801a8574a..dc354ac2f 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -43,6 +43,7 @@ from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_
+ from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
+ from vllm.distributed.parallel_state import (
+     get_dcp_group,
++    get_ep_group,
+     get_pp_group,
+     get_tp_group,
+     graph_capture,
+@@ -153,6 +154,7 @@ from vllm.v1.kv_cache_interface import (
+     UniformTypeKVCacheSpecs,
+ )
+ from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
++from vllm.v1.metrics.stats import EplbMetrics
+ from vllm.v1.outputs import (
+     EMPTY_MODEL_RUNNER_OUTPUT,
+     AsyncModelRunnerOutput,
+@@ -4563,6 +4565,15 @@ class GPUModelRunner(
+         with record_function_or_nullcontext("gpu_model_runner: eplb"):
+             self.eplb_step()
+ 
++        eplb_metrics: EplbMetrics | None = None
++        if self.eplb_state is not None:
++            delta_per_model = self.eplb_state.get_latest_metric_delta()
++            if delta_per_model:
++                eplb_metrics = EplbMetrics(
++                    ep_rank=get_ep_group().device_group.rank(),
++                    num_routed_tokens=delta_per_model,
++                )
++
+         # self.kv_connector_output may be modified during drafting
+         kv_connector_output = self.kv_connector_output
+         self.kv_connector_output = None
+@@ -4581,6 +4592,7 @@ class GPUModelRunner(
+                 num_nans_in_logits=num_nans_in_logits,
+                 cudagraph_stats=cudagraph_stats,
+                 routed_experts=None,
++                eplb_metrics=eplb_metrics,
+             )
+ 
+         if not self.use_async_scheduling:

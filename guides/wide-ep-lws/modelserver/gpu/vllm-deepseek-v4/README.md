@@ -43,6 +43,22 @@ Each deployment is a different prefill : decode operating point. Pick one and ap
 kubectl apply -n ${NAMESPACE} -k deployments/${DEPLOYMENT}
 ```
 
+### SGLang-parity operating points
+
+These deployments mirror the prefill : decode GPU splits SemiAnalysis used for the
+`dynamo-sglang` runs (DeepSeek-V4-Pro, GB200, ISL 8192 / OSL 1024), so vLLM can be measured
+under the same topology. They change only the prefill/decode worker counts — engine args are
+unchanged from the base. Suggested sa-bench concurrency per point is in the last column.
+
+| Deployment                          | Layout                                   | Nodes / GPUs | Bench conc |
+| ----------------------------------- | ---------------------------------------- | ------------ | ---------- |
+| `oci-sglang-conc512-8p16d`          | 1 prefill (DEP8) : 1 decode (DEP16)      | 6 / 24       | 512        |
+| `oci-sglang-conc1536-16p16d`        | 2 prefill (DEP8) : 1 decode (DEP16)      | 8 / 32       | 1536       |
+| `oci-sglang-conc4096-32p16d`        | 4 prefill (DEP8) : 1 decode (DEP16)      | 12 / 48      | 4096       |
+| `oci-sglang-conc8192-40p16d`        | 5 prefill (DEP8) : 1 decode (DEP16)      | 14 / 56      | 8192       |
+| `oci-sglang-conc8192-48p12d`        | 6 prefill (DEP8) : 1 decode (DEP12)      | 15 / 60      | 8192       |
+| `oci-sglang-conc256-8p32d`          | 1 prefill (DEP8) : 2 decode (DEP16)      | 10 / 40      | 256        |
+
 ## Verification
 
 Follow the [Verification steps in the wide-ep-lws guide](../../../README.md#verification),
